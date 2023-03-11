@@ -204,10 +204,11 @@ class TransformerModel(nn.Module):
 
 
 class EmbeddingAutoEncoder(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, dropout_prob=0.0):
+    def __init__(self, num_embeddings, embedding_dim, interpolate_temperature=1.0, dropout_prob=0.0):
         super(EmbeddingAutoEncoder, self).__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
+        self.interpolate_temperature = interpolate_temperature
         self.embedding = nn.Embedding(
             num_embeddings=self.num_embeddings,
             embedding_dim=self.embedding_dim
@@ -228,7 +229,7 @@ class EmbeddingAutoEncoder(nn.Module):
         return x
 
     def interpolate(self, x):
-        logits = self.get_logits(x)
+        logits = self.get_logits(x) / self.interpolate_temperature
         weights = logits.softmax(dim=-1)
         interpolated = torch.einsum('nle,ed->nld', weights, self.embedding.weight)
         interpolated = F.normalize(interpolated, dim=-1) * math.sqrt(self.embedding_dim)
