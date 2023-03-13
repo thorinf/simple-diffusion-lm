@@ -37,10 +37,6 @@ class SentencePieceTokenizer:
     def __len__(self):
         return len(self.sp)
 
-    def encode_from_file_path(self, file_path):
-        text = get_text(file_path)
-        return self.encode(text), text
-
     def encode(self, text):
         return self.sp.encode(text)
 
@@ -312,6 +308,10 @@ class Diffusion:
         x_estimation = torch.zeros_like(x_t)
         if self.self_conditioning and random.uniform(0, 1) < 0.5:
             x_estimation = self.estimator(torch.cat([x_noised, x_cond, x_estimation], dim=-1), t, len_mask)
+
+            if self.interpolate is not None:
+                x_estimation = self.interpolate(x_estimation)
+
             x_estimation = torch.where(cond_mask.unsqueeze(-1), torch.zeros_like(x_estimation), x_estimation)
             x_estimation = x_estimation.detach()
 
@@ -328,7 +328,7 @@ class Diffusion:
 
 
 class DiffusionLM(nn.Module):
-    def __init__(self, num_embedding=1000, embedding_dim=64, model_dim=512, num_layers=4, dropout_prob=0.2):
+    def __init__(self, num_embedding=1000, embedding_dim=64, model_dim=512, num_layers=8, dropout_prob=0.2):
         super(DiffusionLM, self).__init__()
         self.num_embedding = num_embedding
         self.embedding_dim = embedding_dim
@@ -345,7 +345,10 @@ class DiffusionLM(nn.Module):
             num_layers=num_layers,
             dropout_prob=dropout_prob
         )
-        self.diffusion = Diffusion(estimator=self.estimator, interpolate=self.embedding_autoenc.interpolate)
+        self.diffusion = Diffusion(
+            estimator=self.estimator,
+            interpolate=self.embedding_autoenc.interpolate,
+        )
 
         self.loss_ce = nn.CrossEntropyLoss(reduction='none')
 
@@ -374,7 +377,7 @@ class DiffusionLM(nn.Module):
         return loss, loss_diff, loss_reconstruction, accuracy
 
     def forward(self, z):
-        x_0 = self.diffusion.reverse_diffusion(z, 100, 0.0)
+        x_0 = self.diffusion.reverse_diffusion(z, 200, 0.0)
         return self.embedding_autoenc.get_logits(x_0).argmax(dim=-1)
 
 
@@ -385,23 +388,23 @@ def linear_decay_with_warmup(step, max_learning_rate, warmup_steps, hold_steps, 
         return max_learning_rate
     else:
         offset = warmup_steps + hold_steps
-        scale = 1 - (step - offset) / (decay_steps - offset)
+        scale = 1 - (step - offset) / decay_steps
         return max(max_learning_rate * scale, min_learning_rate)
 
 
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('-ep', '--epochs', type=int, default=100)
-    parser.add_argument('-b', '--batch_size', type=int, default=64)
+    parser.add_argument('-b', '--batch_size', type=int, default=32)
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
     parser.add_argument('-decs', '--decay_steps', type=int, default=200000)
-    parser.add_argument('-wd', '--weight_decay', type=float, default=0.1)
-    parser.add_argument('-acc', '--accumulation_steps', type=int, default=8)
+    parser.add_argument('-wd', '--weight_decay', type=float, default=0.0)
+    parser.add_argument('-acc', '--accumulation_steps', type=int, default=2)
 
     parser.add_argument('-edim', '--embedding_dim', type=int, default=64)
     parser.add_argument('-mdim', '--model_dim', type=int, default=512)
-    parser.add_argument('-numl', '--num_layers', type=int, default=4)
-    parser.add_argument('-do', '--dropout_prob', type=float, default=0.0)
+    parser.add_argument('-numl', '--num_layers', type=int, default=8)
+    parser.add_argument('-do', '--dropout_prob', type=float, default=0.1)
 
     parser.add_argument('-ckpt', '--checkpoint', type=str, required=True)
     parser.add_argument('-d', '--data_path', type=str, required=True)
@@ -453,24 +456,25 @@ def train():
     optim = torch.optim.Adam(
         model.parameters(),
         lr=args.learning_rate,
-        betas=(0.9, 0.99),
+        betas=(0.9, 0.999),
         weight_decay=args.weight_decay
     )
     if 'optimizer_state_dict' in checkpoint:
         optim.load_state_dict(checkpoint['optimizer_state_dict'])
 
     num_updates = checkpoint.get('num_updates', 0)
-    lr_lambda = lambda step: linear_decay_with_warmup(step, args.learning_rate, 1000, 0, args.decay_steps)
+    lr_lambda = lambda step: linear_decay_with_warmup(step, args.learning_rate, 2000, 0, args.decay_steps)
 
     for ep in range(0, args.epochs):
         model.train()
         pbar = tqdm(dataloader)
+        pbar.set_description(f"epoch: {ep}")
+
         for idx, (w, lengths) in enumerate(pbar):
             w = w.to(device)
             lengths = lengths.to(device)
             loss, loss_diff, loss_reconstruction, accuracy = model.compute_loss(w, lengths)
 
-            pbar.set_description(f"epoch: {ep}")
             pbar.set_postfix({
                 "loss": loss.item(),
                 "mse": loss_diff.item(),
