@@ -91,22 +91,24 @@ class MultiHeadAttention(nn.Module):
         self.rotary_emb = rotary_embedding
 
     def forward(self, q, k, v, mask=None):
+        batch_size, seq_length, _ = q.size()
+
         q, k, v = self.w_q(q), self.w_k(k), self.w_v(v)
 
-        q = q.view((q.shape[0], -1, self.num_heads, self.head_dim)).transpose(2, 1)
-        k = k.view((k.shape[0], -1, self.num_heads, self.head_dim)).transpose(2, 1)
-        v = v.view((v.shape[0], -1, self.num_heads, self.head_dim))
+        q = q.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.rotary_emb is not None:
             q = self.rotary_emb.rotate_queries_or_keys(q)
             k = self.rotary_emb.rotate_queries_or_keys(k)
 
-        score = torch.einsum('nhqd,nhkd->nhqk', q, k) / math.sqrt(self.head_dim)
+        score = torch.einsum('bnqd,bnkd->bnqk', q, k) / math.sqrt(self.head_dim)
         if mask is not None:
-            score = score.masked_fill(mask == 0, -10000)
+            score = score.masked_fill(mask == 0, -1e4)
 
-        out = torch.einsum('nhqk,nkhd->nqhd', score.softmax(dim=-1), v)
-        out = out.reshape((q.shape[0], -1, self.model_dim))
+        out = torch.einsum('bnqk,bnkd->bnqd', score.softmax(dim=-1), v)
+        out = out.transpose(1, 2).contiguous().view(batch_size, -1, self.model_dim)
         return self.w_o(out)
 
 
@@ -124,9 +126,7 @@ class TransformerEncoderLayer(nn.Module):
         self.ffn = nn.Sequential(
             nn.Linear(dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(p=drop_prob),
             nn.Linear(hidden_dim, dim),
-            nn.Dropout(p=drop_prob)
         )
         self.dropout2 = nn.Dropout(p=drop_prob)
 
@@ -160,6 +160,7 @@ class TransformerModel(nn.Module):
     def __init__(self, input_dim, target_dim, model_dim, num_layers=4, learned_sinusoidal_dim=128, dropout_prob=0.0):
         super(TransformerModel, self).__init__()
         self.model_dim = model_dim
+
         self.time_mlp = nn.Sequential(
             LearnedSinusoidalPosEmb(learned_sinusoidal_dim),
             nn.Linear(learned_sinusoidal_dim + 1, 128),
@@ -168,10 +169,12 @@ class TransformerModel(nn.Module):
             nn.Linear(128, 4 * num_layers),
             nn.GELU(),
         )
+
         self.project = nn.Sequential(
             nn.Linear(input_dim, model_dim),
             nn.Dropout(p=dropout_prob)
         )
+
         self.encoder_layers = nn.ModuleList(
             TransformerEncoderLayer(
                 dim=model_dim,
@@ -180,6 +183,8 @@ class TransformerModel(nn.Module):
                 drop_prob=dropout_prob
             )
             for _ in range(num_layers))
+
+        self.norm = nn.LayerNorm(model_dim)
         self.out = nn.Linear(model_dim, target_dim)
 
     def forward(self, x, t, length_mask=None):
@@ -196,11 +201,11 @@ class TransformerModel(nn.Module):
             gammas = scaling_weights[4 * i + 2:4 * i + 4]
             x = layer(x, length_mask, betas=betas, gammas=gammas)
 
-        return self.out(x)
+        return self.out(self.norm(x)), x
 
 
 class EmbeddingAutoEncoder(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, interpolate_temperature=1.0, dropout_prob=0.0):
+    def __init__(self, num_embeddings, embedding_dim, latent_dim, interpolate_temperature=1.0, dropout_prob=0.0):
         super(EmbeddingAutoEncoder, self).__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
@@ -210,9 +215,9 @@ class EmbeddingAutoEncoder(nn.Module):
             embedding_dim=self.embedding_dim
         )
         nn.init.normal_(self.embedding.weight, std=0.001)
-
         self.dropout = nn.Dropout(p=dropout_prob)
-        self.lm_head = nn.Linear(self.embedding_dim, num_embeddings)
+        self.norm = nn.LayerNorm(latent_dim)
+        self.lm_head = nn.Linear(latent_dim, num_embeddings)
 
     def get_embeddings(self, w):
         x = self.embedding(w)
@@ -220,6 +225,7 @@ class EmbeddingAutoEncoder(nn.Module):
         return x
 
     def get_logits(self, x):
+        x = self.norm(x)
         x = self.dropout(x)
         x = self.lm_head(x)
         return x
@@ -230,6 +236,11 @@ class EmbeddingAutoEncoder(nn.Module):
         interpolated = torch.einsum('nle,ed->nld', weights, self.embedding.weight)
         interpolated = F.normalize(interpolated, dim=-1) * math.sqrt(self.embedding_dim)
         return interpolated
+
+    def dist_embedding(self, x):
+        e = self.embedding.weight
+        e = F.normalize(e, dim=-1) * math.sqrt(self.embedding_dim)
+        return torch.cdist(x, e)
 
 
 class Diffusion:
@@ -270,10 +281,10 @@ class Diffusion:
             if self.normalize:
                 x_t = x_t / x_t.std(dim=-1, keepdim=True)
 
-            x_estimation = self.estimator(torch.cat([x_t, torch.zeros_like(x_t), x_estimation], dim=-1), t_now)
+            x_estimation, latent = self.estimator(torch.cat([x_t, torch.zeros_like(x_t), x_estimation], dim=-1), t_now)
 
             if self.interpolate is not None:
-                x_estimation = self.interpolate(x_estimation)
+                x_estimation = self.interpolate(latent)
 
             if self.sampling_method == 'ddim':
                 x_t = self.ddim_step(x_t, x_estimation, t_now, t_next)
@@ -303,28 +314,29 @@ class Diffusion:
             x_t = x_t / x_t.std(dim=-1, keepdim=True)
 
         x_noised = torch.where(cond_mask.unsqueeze(-1), torch.zeros_like(x_t), x_t)
-        x_cond = torch.where(cond_mask.unsqueeze(-1), x_0, torch.zeros_like(x_0))
+        x_cond = torch.where(cond_mask.unsqueeze(-1), x_t, torch.zeros_like(x_t))
 
         x_estimation = torch.zeros_like(x_t)
         if self.self_conditioning and random.uniform(0, 1) < 0.5:
-            x_estimation = self.estimator(torch.cat([x_noised, x_cond, x_estimation], dim=-1), t, len_mask)
+            with torch.no_grad():
+                x_estimation, latent = self.estimator(torch.cat([x_noised, x_cond, x_estimation], dim=-1), t, len_mask)
 
-            if self.interpolate is not None:
-                x_estimation = self.interpolate(x_estimation)
+                if self.interpolate is not None:
+                    x_estimation = self.interpolate(latent)
 
-            x_estimation = torch.where(cond_mask.unsqueeze(-1), torch.zeros_like(x_estimation), x_estimation)
-            x_estimation = x_estimation.detach()
+                x_estimation = torch.where(cond_mask.unsqueeze(-1), torch.zeros_like(x_estimation), x_estimation)
+                x_estimation = x_estimation.detach()
 
-        x_0_estimation = self.estimator(torch.cat([x_noised, x_cond, x_estimation], dim=-1), t, len_mask)
+        x_0_estimation, latent = self.estimator(torch.cat([x_noised, x_cond, x_estimation], dim=-1), t, len_mask)
 
         loss = (x_0 - x_0_estimation) ** 2.0
-        return loss, x_0_estimation, t
+        return loss, x_0_estimation, latent
 
     def compute_loss(self, x_0, len_mask, cond_mask, offset=1e-5):
         t = torch.rand(x_0.shape[0], dtype=x_0.dtype, device=x_0.device, requires_grad=False)
         t = torch.clamp(t, offset, 1.0 - offset)
-        loss, x_0_estimation, t = self.loss_t(x_0, t, len_mask, cond_mask)
-        return loss, x_0_estimation
+        loss, x_0_estimation, latent = self.loss_t(x_0, t, len_mask, cond_mask)
+        return loss, x_0_estimation, latent
 
 
 class DiffusionLM(nn.Module):
@@ -336,7 +348,7 @@ class DiffusionLM(nn.Module):
         self.num_layers = num_layers
         self.embedding_grad_scale = 1.0
 
-        self.embedding_autoenc = EmbeddingAutoEncoder(self.num_embedding, self.embedding_dim)
+        self.embedding_autoenc = EmbeddingAutoEncoder(self.num_embedding, self.embedding_dim, self.model_dim)
 
         self.estimator = TransformerModel(
             input_dim=self.embedding_dim * 3,
@@ -361,10 +373,10 @@ class DiffusionLM(nn.Module):
         cond_mask = torch.rand(w.shape, device=w.device) < 0.1
         diff_mask = len_mask & torch.logical_not(cond_mask)
 
-        loss_diff, x_0_estimation = self.diffusion.compute_loss(x, len_mask, cond_mask)
+        loss_diff, _, latent = self.diffusion.compute_loss(x, len_mask, cond_mask)
         loss_diff = loss_diff[diff_mask].mean(-1)
 
-        logits = self.embedding_autoenc.get_logits(x_0_estimation)
+        logits = self.embedding_autoenc.get_logits(latent)
         w = w.masked_fill(torch.logical_not(diff_mask), -100)
         loss_reconstruction = self.loss_ce(logits.transpose(2, 1), w)
 
@@ -376,9 +388,10 @@ class DiffusionLM(nn.Module):
 
         return loss, loss_diff, loss_reconstruction, accuracy
 
+    @torch.no_grad()
     def forward(self, z):
         x_0 = self.diffusion.reverse_diffusion(z, 200, 0.0)
-        return self.embedding_autoenc.get_logits(x_0).argmax(dim=-1)
+        return self.embedding_autoenc.dist_embedding(x_0).argmin(dim=-1)
 
 
 def linear_decay_with_warmup(step, max_learning_rate, warmup_steps, hold_steps, decay_steps, min_learning_rate=1e-8):
@@ -399,7 +412,7 @@ def train():
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
     parser.add_argument('-decs', '--decay_steps', type=int, default=200000)
     parser.add_argument('-wd', '--weight_decay', type=float, default=0.0)
-    parser.add_argument('-acc', '--accumulation_steps', type=int, default=2)
+    parser.add_argument('-acc', '--accumulation_steps', type=int, default=8)
 
     parser.add_argument('-edim', '--embedding_dim', type=int, default=64)
     parser.add_argument('-mdim', '--model_dim', type=int, default=512)
@@ -456,7 +469,7 @@ def train():
     optim = torch.optim.Adam(
         model.parameters(),
         lr=args.learning_rate,
-        betas=(0.9, 0.999),
+        betas=(0.9, 0.99),
         weight_decay=args.weight_decay
     )
     if 'optimizer_state_dict' in checkpoint:
