@@ -23,6 +23,7 @@ They can be installed with the following commands:
 ```commandline
 pip install sentencepiece
 pip install rotary-embedding-torch
+pip install tqdm
 ```
 
 ### Pre-Processing:
