@@ -15,7 +15,7 @@ There's accompanying notes below to explain design decisions as well as referenc
 
 ### Environment Setup:
 
-Aside from PyTorch, the training script requires two other packages;
+Aside from PyTorch, the training script requires `tqdm` and two other packages;
 [SentencePiece](https://github.com/google/sentencepiece) and
 [RotaryEmbedding](https://github.com/lucidrains/rotary-embedding-torch).
 They can be installed with the following commands:
