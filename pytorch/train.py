@@ -38,7 +38,7 @@ class SentencePieceTokenizer:
         return len(self.sp)
 
     def encode(self, text):
-        return self.sp.encode(text)
+        return self.sp.encode(text, enable_sampling=True, alpha=0.1, nbest_size=3)
 
     def decode(self, encoded):
         return self.sp.decode(encoded)
@@ -57,8 +57,8 @@ class TextDataset(torch.utils.data.Dataset):
         with open(self.path, 'r', encoding='utf-8') as file:
             file.seek(self.offsets[idx])
             text = file.readline().strip()
-        encoded = self.tokenizer.encode(text)
-        return encoded
+        ids = self.tokenizer.encode(text)
+        return ids
 
 
 class Collate:
@@ -66,17 +66,17 @@ class Collate:
         self.crop_length = crop_length
 
     def __call__(self, batch):
-        encoded_list = [(torch.tensor(tokens, dtype=torch.int64)) for tokens in batch]
-        encoded = torch.nn.utils.rnn.pad_sequence(encoded_list, batch_first=True, padding_value=0)
-        lengths = torch.tensor([x.shape[0] for x in encoded_list])
-        if 0 < self.crop_length < encoded.shape[1]:
-            encoded = encoded[:, :self.crop_length]
+        ids_list = [(torch.tensor(ids, dtype=torch.int64)) for ids in batch]
+        ids = torch.nn.utils.rnn.pad_sequence(ids_list, batch_first=True, padding_value=0)
+        lengths = torch.tensor([x.shape[0] for x in ids_list])
+        if 0 < self.crop_length < ids.shape[1]:
+            ids = ids[:, :self.crop_length]
             lengths = torch.minimum(lengths, torch.tensor(self.crop_length))
-        return encoded, lengths
+        return ids, lengths
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, dim, num_heads, qkv_bias=False, rotary_embedding=None):
+    def __init__(self, dim, num_heads, qkv_bias=True, rotary_embedding=None):
         super(MultiHeadAttention, self).__init__()
         assert (dim % num_heads == 0)
         self.model_dim = dim
@@ -87,6 +87,7 @@ class MultiHeadAttention(nn.Module):
         self.w_k = nn.Linear(dim, dim, bias=qkv_bias)
         self.w_v = nn.Linear(dim, dim, bias=qkv_bias)
         self.w_o = nn.Linear(dim, dim)
+        self.dropout_att = nn.Dropout(p=0.1)
 
         self.rotary_emb = rotary_embedding
 
@@ -103,12 +104,14 @@ class MultiHeadAttention(nn.Module):
             q = self.rotary_emb.rotate_queries_or_keys(q)
             k = self.rotary_emb.rotate_queries_or_keys(k)
 
-        score = torch.einsum('bnqd,bnkd->bnqk', q, k) / math.sqrt(self.head_dim)
+        score = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
-            score = score.masked_fill(mask == 0, -1e4)
+            score = score.masked_fill(mask == 0, -1e9)
+        score = F.softmax(score, dim=-1)
+        score = self.dropout_att(score)
+        out = score @ v
 
-        out = torch.einsum('bnqk,bnkd->bnqd', score.softmax(dim=-1), v)
-        out = out.transpose(1, 2).contiguous().view(batch_size, -1, self.model_dim)
+        out = out.transpose(1, 2).contiguous().view(batch_size, seq_length, self.model_dim)
         return self.w_o(out)
 
 
@@ -119,6 +122,7 @@ class TransformerEncoderLayer(nn.Module):
         self.attention = MultiHeadAttention(
             dim=dim,
             num_heads=num_heads,
+            qkv_bias=True,
             rotary_embedding=RotaryEmbedding(dim=32)
         )
         self.dropout1 = nn.Dropout(p=drop_prob)
@@ -130,16 +134,16 @@ class TransformerEncoderLayer(nn.Module):
         )
         self.dropout2 = nn.Dropout(p=drop_prob)
 
-    def forward(self, x, mask, betas=(0.0, 0.0), gammas=(0.0, 0.0)):
+    def forward(self, x, mask, gammas=(0.0, 0.0), betas=(0.0, 0.0)):
         res = x
         x = self.norm1(x)
-        x = gammas[0] * x + betas[0]
+        x = (gammas[0] * x) + betas[0]
         x = self.attention(q=x, k=x, v=x, mask=mask)
         x = res + self.dropout1(x)
 
         res = x
         x = self.norm2(x)
-        x = gammas[1] * x + betas[1]
+        x = (gammas[1] * x) + betas[1]
         x = self.ffn(x)
         x = res + self.dropout2(x)
         return x
@@ -157,16 +161,17 @@ class LearnedSinusoidalPosEmb(nn.Module):
 
 
 class TransformerModel(nn.Module):
-    def __init__(self, input_dim, target_dim, model_dim, num_layers=4, learned_sinusoidal_dim=128, dropout_prob=0.0):
+    def __init__(self, input_dim, target_dim, model_dim, num_layers=8, learned_sinusoidal_dim=128, dropout_prob=0.0):
         super(TransformerModel, self).__init__()
         self.model_dim = model_dim
+        self.num_layers = num_layers
 
         self.time_mlp = nn.Sequential(
             LearnedSinusoidalPosEmb(learned_sinusoidal_dim),
             nn.Linear(learned_sinusoidal_dim + 1, 128),
             nn.GELU(),
             nn.Dropout(p=dropout_prob),
-            nn.Linear(128, 4 * num_layers),
+            nn.Linear(128, num_layers * 4 * model_dim),
             nn.GELU(),
         )
 
@@ -195,11 +200,11 @@ class TransformerModel(nn.Module):
             x = x * length_mask.unsqueeze(-1)
             length_mask = length_mask.unsqueeze(1).unsqueeze(1)
 
-        scaling_weights = time_emb.unsqueeze(2).split(1, dim=1)
+        scaling_weights = time_emb.view(-1, self.num_layers * 4, self.model_dim).split(1, dim=1)
         for i, layer in enumerate(self.encoder_layers):
-            betas = scaling_weights[4 * i:4 * i + 2]
-            gammas = scaling_weights[4 * i + 2:4 * i + 4]
-            x = layer(x, length_mask, betas=betas, gammas=gammas)
+            gammas = scaling_weights[4 * i], scaling_weights[4 * i + 1]
+            betas = scaling_weights[4 * i + 2], scaling_weights[4 * i + 3]
+            x = layer(x, length_mask, gammas=gammas, betas=betas)
 
         return self.out(self.norm(x)), x
 
@@ -216,16 +221,16 @@ class EmbeddingAutoEncoder(nn.Module):
         )
         nn.init.normal_(self.embedding.weight, std=0.001)
         self.dropout = nn.Dropout(p=dropout_prob)
-        self.norm = nn.LayerNorm(latent_dim)
+        self.norm_latent = nn.LayerNorm(latent_dim)
         self.lm_head = nn.Linear(latent_dim, num_embeddings)
 
-    def get_embeddings(self, w):
-        x = self.embedding(w)
+    def get_embeddings(self, ids):
+        x = self.embedding(ids)
         x = F.normalize(x, dim=-1) * math.sqrt(self.embedding_dim)
         return x
 
     def get_logits(self, x):
-        x = self.norm(x)
+        x = self.norm_latent(x)
         x = self.dropout(x)
         x = self.lm_head(x)
         return x
@@ -364,23 +369,23 @@ class DiffusionLM(nn.Module):
 
         self.loss_ce = nn.CrossEntropyLoss(reduction='none')
 
-    def compute_loss(self, w, lengths):
-        x = self.embedding_autoenc.get_embeddings(w)
+    def compute_loss(self, ids, lengths):
+        x = self.embedding_autoenc.get_embeddings(ids)
         x = self.embedding_grad_scale * x + (1.0 - self.embedding_grad_scale) * x.detach()
 
-        len_mask = torch.arange(w.shape[1], device=w.device).unsqueeze(0) < lengths.unsqueeze(1)
+        len_mask = torch.arange(ids.shape[1], device=ids.device).unsqueeze(0) < lengths.unsqueeze(1)
         # conditional masking could be much better. if true, use original embeddings
-        cond_mask = torch.rand(w.shape, device=w.device) < 0.1
+        cond_mask = torch.rand(ids.shape, device=ids.device) < 0.1
         diff_mask = len_mask & torch.logical_not(cond_mask)
 
         loss_diff, _, latent = self.diffusion.compute_loss(x, len_mask, cond_mask)
         loss_diff = loss_diff[diff_mask].mean(-1)
 
         logits = self.embedding_autoenc.get_logits(latent)
-        w = w.masked_fill(torch.logical_not(diff_mask), -100)
-        loss_reconstruction = self.loss_ce(logits.transpose(2, 1), w)
+        ids = ids.masked_fill(torch.logical_not(diff_mask), -100)
+        loss_reconstruction = self.loss_ce(logits.transpose(2, 1), ids)
 
-        accuracy = (logits.argmax(dim=-1) == w).float().sum() / diff_mask.sum()
+        accuracy = (logits.argmax(dim=-1) == ids).float().sum() / diff_mask.sum()
 
         loss_diff = loss_diff.mean()
         loss_reconstruction = loss_reconstruction.sum() / diff_mask.sum()
@@ -476,17 +481,18 @@ def train():
         optim.load_state_dict(checkpoint['optimizer_state_dict'])
 
     num_updates = checkpoint.get('num_updates', 0)
-    lr_lambda = lambda step: linear_decay_with_warmup(step, args.learning_rate, 2000, 0, args.decay_steps)
+    lr_lambda = lambda step: linear_decay_with_warmup(step, args.learning_rate, 2000, 0, args.decay_steps,
+                                                      args.learning_rate * 0.1)
 
     for ep in range(0, args.epochs):
         model.train()
         pbar = tqdm(dataloader)
         pbar.set_description(f"epoch: {ep}")
 
-        for idx, (w, lengths) in enumerate(pbar):
-            w = w.to(device)
+        for idx, (ids, lengths) in enumerate(pbar):
+            ids = ids.to(device)
             lengths = lengths.to(device)
-            loss, loss_diff, loss_reconstruction, accuracy = model.compute_loss(w, lengths)
+            loss, loss_diff, loss_reconstruction, accuracy = model.compute_loss(ids, lengths)
 
             pbar.set_postfix({
                 "loss": loss.item(),
