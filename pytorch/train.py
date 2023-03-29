@@ -416,7 +416,7 @@ def train():
     parser.add_argument('-b', '--batch_size', type=int, default=32)
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
     parser.add_argument('-decs', '--decay_steps', type=int, default=200000)
-    parser.add_argument('-wd', '--weight_decay', type=float, default=0.0)
+    parser.add_argument('-wd', '--weight_decay', type=float, default=0.01)
     parser.add_argument('-acc', '--accumulation_steps', type=int, default=8)
 
     parser.add_argument('-edim', '--embedding_dim', type=int, default=64)
