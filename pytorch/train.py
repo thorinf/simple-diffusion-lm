@@ -416,7 +416,7 @@ def train():
     parser.add_argument('-b', '--batch_size', type=int, default=32)
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
     parser.add_argument('-decs', '--decay_steps', type=int, default=200000)
-    parser.add_argument('-wd', '--weight_decay', type=float, default=0.01)
+    parser.add_argument('-wd', '--weight_decay', type=float, default=1e-4)
     parser.add_argument('-acc', '--accumulation_steps', type=int, default=8)
 
     parser.add_argument('-edim', '--embedding_dim', type=int, default=64)
@@ -501,7 +501,11 @@ def train():
                 "accuracy": accuracy.item(),
             })
 
-            (loss / args.accumulation_steps).backward()
+            if torch.isfinite(loss):
+                (loss / args.accumulation_steps).backward()
+            else:
+                print("Loss is not finite, backward pass not computed.")
+                
             if ((idx + 1) % args.accumulation_steps == 0) or (idx + 1 == len(dataloader)):
                 optim.param_groups[0]['lr'] = lr_lambda(num_updates)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0)
