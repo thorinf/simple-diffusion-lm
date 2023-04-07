@@ -38,6 +38,10 @@ class SentencePieceTokenizer:
         return len(self.sp)
 
     @property
+    def eos_id(self):
+        return self.sp.eos_id()
+
+    @property
     def pad_id(self):
         return self.sp.pad_id()
 
@@ -66,21 +70,26 @@ class TextDataset(torch.utils.data.Dataset):
 
 
 class Collate:
-    def __init__(self, crop_length=-1, pad_id=-1, length_include_pad=False):
-        assert not (pad_id < 0 and length_include_pad)
+    def __init__(self, crop_length=-1, eos_id=-1, pad_id=-1, length_includes_pad=False):
+        assert not (pad_id < 0 and length_includes_pad)
         self.crop_length = crop_length
+        self.eos_id = eos_id
         self.pad_id = pad_id
-        self.length_include_pad = length_include_pad
+        self.length_includes_pad = length_includes_pad
 
     def __call__(self, batch):
-        ids_list = [(torch.tensor(ids, dtype=torch.int64)) for ids in batch]
+        ids_end = [self.eos_id] if self.eos_id >= 0 else []
+        ids_list = [torch.tensor(ids + ids_end, dtype=torch.int64) for ids in batch]
         ids = torch.nn.utils.rnn.pad_sequence(ids_list, batch_first=True, padding_value=self.pad_id)
         lengths = torch.tensor([x.shape[0] for x in ids_list])
+
         if 0 < self.crop_length < ids.shape[1]:
             ids = ids[:, :self.crop_length]
             lengths = torch.minimum(lengths, torch.tensor(self.crop_length))
-        if self.length_include_pad:
+
+        if self.length_includes_pad:
             lengths = torch.full_like(lengths, lengths.max())
+
         return ids, lengths
 
 
@@ -490,7 +499,12 @@ def train():
         [print(text) for text in tokenizer.decode(outputs)]
 
     dataset = TextDataset(path=args.data_path, tokenizer=tokenizer)
-    collate = Collate(crop_length=args.crop_length, pad_id=tokenizer.pad_id, length_include_pad=True)
+    collate = Collate(
+        crop_length=args.crop_length,
+        eos_id=tokenizer.eos_id,
+        pad_id=tokenizer.pad_id,
+        length_includes_pad=False
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
