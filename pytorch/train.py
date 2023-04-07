@@ -37,8 +37,12 @@ class SentencePieceTokenizer:
     def __len__(self):
         return len(self.sp)
 
+    @property
+    def pad_id(self):
+        return self.sp.pad_id()
+
     def encode(self, text):
-        return self.sp.encode(text, enable_sampling=True, alpha=0.1, nbest_size=3)
+        return self.sp.encode(text, enable_sampling=True, alpha=0.1, nbest_size=5)
 
     def decode(self, encoded):
         return self.sp.decode(encoded)
@@ -47,8 +51,8 @@ class SentencePieceTokenizer:
 class TextDataset(torch.utils.data.Dataset):
     def __init__(self, path: str, tokenizer: SentencePieceTokenizer):
         self.path = path
-        self.offsets = get_line_offsets(path)
         self.tokenizer = tokenizer
+        self.offsets = get_line_offsets(path)
 
     def __len__(self) -> int:
         return len(self.offsets)
@@ -62,16 +66,21 @@ class TextDataset(torch.utils.data.Dataset):
 
 
 class Collate:
-    def __init__(self, crop_length=-1):
+    def __init__(self, crop_length=-1, pad_id=-1, length_include_pad=False):
+        assert not (pad_id < 0 and length_include_pad)
         self.crop_length = crop_length
+        self.pad_id = pad_id
+        self.length_include_pad = length_include_pad
 
     def __call__(self, batch):
         ids_list = [(torch.tensor(ids, dtype=torch.int64)) for ids in batch]
-        ids = torch.nn.utils.rnn.pad_sequence(ids_list, batch_first=True, padding_value=0)
+        ids = torch.nn.utils.rnn.pad_sequence(ids_list, batch_first=True, padding_value=self.pad_id)
         lengths = torch.tensor([x.shape[0] for x in ids_list])
         if 0 < self.crop_length < ids.shape[1]:
             ids = ids[:, :self.crop_length]
             lengths = torch.minimum(lengths, torch.tensor(self.crop_length))
+        if self.length_include_pad:
+            lengths = torch.full_like(lengths, lengths.max())
         return ids, lengths
 
 
@@ -104,12 +113,15 @@ class MultiHeadAttention(nn.Module):
             q = self.rotary_emb.rotate_queries_or_keys(q)
             k = self.rotary_emb.rotate_queries_or_keys(k)
 
-        score = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            score = score.masked_fill(mask == 0, -1e9)
-        score = F.softmax(score, dim=-1)
-        score = self.dropout_att(score)
-        out = score @ v
+        with torch.backends.cuda.sdp_kernel(enable_mem_efficient=True):
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
+        # score = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # if mask is not None:
+        #     score = score.masked_fill(mask == 0, -1e9)
+        # score = F.softmax(score, dim=-1)
+        # score = self.dropout_att(score)
+        # out = score @ v
 
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_length, self.model_dim)
         return self.w_o(out)
@@ -161,10 +173,12 @@ class LearnedSinusoidalPosEmb(nn.Module):
 
 
 class TransformerModel(nn.Module):
-    def __init__(self, input_dim, target_dim, model_dim, num_layers=8, learned_sinusoidal_dim=128, dropout_prob=0.0):
+    def __init__(self, input_dim, target_dim, model_dim, num_layers=8, learned_sinusoidal_dim=128, dropout_prob=0.0,
+                 layerdrop_prob=0.0):
         super(TransformerModel, self).__init__()
         self.model_dim = model_dim
         self.num_layers = num_layers
+        self.layerdrop_prob = layerdrop_prob
 
         self.time_mlp = nn.Sequential(
             LearnedSinusoidalPosEmb(learned_sinusoidal_dim),
@@ -202,50 +216,13 @@ class TransformerModel(nn.Module):
 
         scaling_weights = time_emb.view(-1, self.num_layers * 4, self.model_dim).split(1, dim=1)
         for i, layer in enumerate(self.encoder_layers):
+            if self.training and random.uniform(0, 1) < self.layerdrop_prob:
+                continue
             gammas = scaling_weights[4 * i], scaling_weights[4 * i + 1]
             betas = scaling_weights[4 * i + 2], scaling_weights[4 * i + 3]
             x = layer(x, length_mask, gammas=gammas, betas=betas)
 
         return self.out(self.norm(x)), x
-
-
-class EmbeddingAutoEncoder(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, latent_dim, interpolate_temperature=1.0, dropout_prob=0.0):
-        super(EmbeddingAutoEncoder, self).__init__()
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
-        self.interpolate_temperature = interpolate_temperature
-        self.embedding = nn.Embedding(
-            num_embeddings=self.num_embeddings,
-            embedding_dim=self.embedding_dim
-        )
-        nn.init.normal_(self.embedding.weight, std=0.001)
-        self.dropout = nn.Dropout(p=dropout_prob)
-        self.norm_latent = nn.LayerNorm(latent_dim)
-        self.lm_head = nn.Linear(latent_dim, num_embeddings)
-
-    def get_embeddings(self, ids):
-        x = self.embedding(ids)
-        x = F.normalize(x, dim=-1) * math.sqrt(self.embedding_dim)
-        return x
-
-    def get_logits(self, x):
-        x = self.norm_latent(x)
-        x = self.dropout(x)
-        x = self.lm_head(x)
-        return x
-
-    def interpolate(self, x):
-        logits = self.get_logits(x) / self.interpolate_temperature
-        weights = logits.softmax(dim=-1)
-        interpolated = torch.einsum('nle,ed->nld', weights, self.embedding.weight)
-        interpolated = F.normalize(interpolated, dim=-1) * math.sqrt(self.embedding_dim)
-        return interpolated
-
-    def dist_embedding(self, x):
-        e = self.embedding.weight
-        e = F.normalize(e, dim=-1) * math.sqrt(self.embedding_dim)
-        return torch.cdist(x, e)
 
 
 class Diffusion:
@@ -296,7 +273,10 @@ class Diffusion:
             elif self.sampling_method == 'ddpm':
                 x_t = self.ddpm_step(x_t, x_estimation, t_now, t_next)
 
-        return x_t
+        t_final = torch.zeros(x_T.shape[0], device=x_T.device)
+        _, latent = self.estimator(torch.cat([x_t, torch.zeros_like(x_t), x_estimation], dim=-1), t_final)
+
+        return x_t, latent
 
     def ddim_step(self, x_t, x_0_estimation, t_now, t_next):
         gamma_now = self.gamma(t_now).unsqueeze(1).unsqueeze(1)
@@ -345,58 +325,100 @@ class Diffusion:
 
 
 class DiffusionLM(nn.Module):
-    def __init__(self, num_embedding=1000, embedding_dim=64, model_dim=512, num_layers=8, dropout_prob=0.2):
+    def __init__(self, num_embeddings=1000, embedding_dim=64, model_dim=512, num_layers=8, dropout_prob=0.2,
+                 layerdrop_prob=0.0):
         super(DiffusionLM, self).__init__()
-        self.num_embedding = num_embedding
+        self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.model_dim = model_dim
         self.num_layers = num_layers
         self.embedding_grad_scale = 1.0
+        self.interpolate_temperature = 1.0
 
-        self.embedding_autoenc = EmbeddingAutoEncoder(self.num_embedding, self.embedding_dim, self.model_dim)
+        self.embedding = nn.Embedding(
+            num_embeddings=self.num_embeddings,
+            embedding_dim=self.embedding_dim
+        )
+        nn.init.normal_(self.embedding.weight, std=0.1)
 
         self.estimator = TransformerModel(
             input_dim=self.embedding_dim * 3,
             target_dim=self.embedding_dim,
             model_dim=self.model_dim,
             num_layers=num_layers,
-            dropout_prob=dropout_prob
+            dropout_prob=dropout_prob,
+            layerdrop_prob=layerdrop_prob
         )
         self.diffusion = Diffusion(
             estimator=self.estimator,
-            interpolate=self.embedding_autoenc.interpolate,
+            interpolate=self.interpolate,
         )
+
+        self.norm_latent = nn.LayerNorm(self.model_dim)
+        self.dropout = nn.Dropout(p=dropout_prob)
+        self.lm_head = nn.Linear(self.model_dim, self.num_embeddings)
 
         self.loss_ce = nn.CrossEntropyLoss(reduction='none')
 
+    def get_embeddings(self, ids):
+        x = self.embedding(ids)
+        x = F.normalize(x, dim=-1) * math.sqrt(self.embedding_dim)
+        return x
+
+    def get_logits(self, x):
+        x = self.norm_latent(x)
+        x = self.dropout(x)
+        x = self.lm_head(x)
+        return x
+
+    def interpolate(self, x):
+        logits = self.get_logits(x) / self.interpolate_temperature
+        weights = logits.softmax(dim=-1)
+        interpolated = torch.einsum('nle,ed->nld', weights, self.embedding.weight)
+        interpolated = F.normalize(interpolated, dim=-1) * math.sqrt(self.embedding_dim)
+        return interpolated
+
+    def dist_embedding(self, x):
+        e = self.embedding.weight
+        e = F.normalize(e, dim=-1) * math.sqrt(self.embedding_dim)
+        return torch.cdist(x, e)
+
+    def cosine_similarity(self, x):
+        e = self.embedding.weight
+        e = F.normalize(e, dim=-1)
+        x = F.normalize(x, dim=-1)
+        cossim = torch.einsum('nld,ed->nle', x, e)
+        return cossim
+
     def compute_loss(self, ids, lengths):
-        x = self.embedding_autoenc.get_embeddings(ids)
+        x = self.get_embeddings(ids)
         x = self.embedding_grad_scale * x + (1.0 - self.embedding_grad_scale) * x.detach()
 
         len_mask = torch.arange(ids.shape[1], device=ids.device).unsqueeze(0) < lengths.unsqueeze(1)
         # conditional masking could be much better. if true, use original embeddings
         cond_mask = torch.rand(ids.shape, device=ids.device) < 0.1
-        diff_mask = len_mask & torch.logical_not(cond_mask)
+        diff_mask = torch.logical_and(len_mask, torch.logical_not(cond_mask))
+        num_elems = diff_mask.sum()
 
-        loss_diff, _, latent = self.diffusion.compute_loss(x, len_mask, cond_mask)
+        loss_diff, x_0_estimation, latent = self.diffusion.compute_loss(x, len_mask, cond_mask)
         loss_diff = loss_diff[diff_mask].mean(-1)
 
-        logits = self.embedding_autoenc.get_logits(latent)
+        logits = self.get_logits(latent)
         ids = ids.masked_fill(torch.logical_not(diff_mask), -100)
         loss_reconstruction = self.loss_ce(logits.transpose(2, 1), ids)
 
-        accuracy = (logits.argmax(dim=-1) == ids).float().sum() / diff_mask.sum()
+        accuracy = (logits.argmax(dim=-1) == ids).float().sum() / num_elems
 
         loss_diff = loss_diff.mean()
-        loss_reconstruction = loss_reconstruction.sum() / diff_mask.sum()
+        loss_reconstruction = loss_reconstruction.sum() / num_elems
         loss = loss_diff + loss_reconstruction
 
         return loss, loss_diff, loss_reconstruction, accuracy
 
     @torch.no_grad()
     def forward(self, z):
-        x_0 = self.diffusion.reverse_diffusion(z, 200, 0.0)
-        return self.embedding_autoenc.dist_embedding(x_0).argmin(dim=-1)
+        x_0, latent = self.diffusion.reverse_diffusion(z, 200, 0.0)
+        return self.get_logits(latent).argmax(dim=-1)
 
 
 def linear_decay_with_warmup(step, max_learning_rate, warmup_steps, hold_steps, decay_steps, min_learning_rate=1e-8):
@@ -416,13 +438,14 @@ def train():
     parser.add_argument('-b', '--batch_size', type=int, default=32)
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
     parser.add_argument('-decs', '--decay_steps', type=int, default=200000)
-    parser.add_argument('-wd', '--weight_decay', type=float, default=0.0)
+    parser.add_argument('-wd', '--weight_decay', type=float, default=1e-4)
     parser.add_argument('-acc', '--accumulation_steps', type=int, default=8)
 
     parser.add_argument('-edim', '--embedding_dim', type=int, default=64)
     parser.add_argument('-mdim', '--model_dim', type=int, default=512)
     parser.add_argument('-numl', '--num_layers', type=int, default=8)
     parser.add_argument('-do', '--dropout_prob', type=float, default=0.1)
+    parser.add_argument('-ld', '--layerdrop_prob', type=float, default=0.05)
 
     parser.add_argument('-ckpt', '--checkpoint', type=str, required=True)
     parser.add_argument('-d', '--data_path', type=str, required=True)
@@ -432,16 +455,21 @@ def train():
 
     args = parser.parse_args()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        torch.backends.cuda.enable_mem_efficient_sdp(enabled=True)
+    else:
+        device = torch.device('cpu')
 
     tokenizer = SentencePieceTokenizer(args.spm_model)
 
     model = DiffusionLM(
-        num_embedding=len(tokenizer),
+        num_embeddings=len(tokenizer),
         embedding_dim=args.embedding_dim,
         model_dim=args.model_dim,
         num_layers=args.num_layers,
-        dropout_prob=args.dropout_prob
+        dropout_prob=args.dropout_prob,
+        layerdrop_prob=args.layerdrop_prob
     )
     model.to(device)
 
@@ -462,7 +490,7 @@ def train():
         [print(text) for text in tokenizer.decode(outputs)]
 
     dataset = TextDataset(path=args.data_path, tokenizer=tokenizer)
-    collate = Collate(crop_length=args.crop_length)
+    collate = Collate(crop_length=args.crop_length, pad_id=tokenizer.pad_id, length_include_pad=True)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -471,7 +499,7 @@ def train():
         collate_fn=collate
     )
 
-    optim = torch.optim.Adam(
+    optim = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
         betas=(0.9, 0.99),
@@ -492,6 +520,7 @@ def train():
         for idx, (ids, lengths) in enumerate(pbar):
             ids = ids.to(device)
             lengths = lengths.to(device)
+
             loss, loss_diff, loss_reconstruction, accuracy = model.compute_loss(ids, lengths)
 
             pbar.set_postfix({
@@ -501,7 +530,11 @@ def train():
                 "accuracy": accuracy.item(),
             })
 
-            (loss / args.accumulation_steps).backward()
+            if torch.isfinite(loss):
+                (loss / args.accumulation_steps).backward()
+            else:
+                ValueError("Loss is not finite, backward pass not computed.")
+
             if ((idx + 1) % args.accumulation_steps == 0) or (idx + 1 == len(dataloader)):
                 optim.param_groups[0]['lr'] = lr_lambda(num_updates)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0)
