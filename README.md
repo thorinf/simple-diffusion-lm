@@ -37,6 +37,21 @@ With a clean text corpus, the SentencePiece model can then be trained.
 Follow the guides on [their repository](https://github.com/google/sentencepiece)
 or [here on PyPI](https://pypi.org/project/sentencepiece/).
 If the text corpus is very large, then creating a subset of the text can get around memory issues.
+Here is an exert from the script that created the BPE model: 
+
+```python
+spm.SentencePieceTrainer.train(
+    input=text_path,
+    model_prefix=name,
+    model_type='bpe',
+    vocab_size=size,
+    user_defined_symbols=[str(i) for i in range(10)],
+    bos_id=0,
+    eos_id=1,
+    pad_id=2,
+    unk_id=3
+)
+```
 
 ### Training:
 
