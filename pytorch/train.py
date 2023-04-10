@@ -105,7 +105,6 @@ class MultiHeadAttention(nn.Module):
         self.w_k = nn.Linear(dim, dim, bias=qkv_bias)
         self.w_v = nn.Linear(dim, dim, bias=qkv_bias)
         self.w_o = nn.Linear(dim, dim)
-        self.dropout_att = nn.Dropout(p=0.1)
 
         self.rotary_emb = rotary_embedding
 
@@ -123,7 +122,7 @@ class MultiHeadAttention(nn.Module):
             k = self.rotary_emb.rotate_queries_or_keys(k)
 
         with torch.backends.cuda.sdp_kernel(enable_mem_efficient=True):
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.2)
 
         # score = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         # if mask is not None:
@@ -235,13 +234,14 @@ class TransformerModel(nn.Module):
 
 
 class Diffusion:
-    def __init__(self, estimator: nn.Module, interpolate=None, self_conditioning=True, normalize=False,
+    def __init__(self, estimator: nn.Module, interpolate=None, self_conditioning=True, normalize=False, masking=None,
                  sampling_method='ddpm'):
         super(Diffusion).__init__()
         self.estimator = estimator
         self.interpolate = interpolate
         self.self_conditioning = self_conditioning
         self.normalize = normalize
+        self.masking = masking
         self.sampling_method = sampling_method
 
     def gamma(self, t, ns=0.0002, ds=0.00025):
@@ -287,6 +287,11 @@ class Diffusion:
 
         return x_t, latent
 
+    def diff_lm_step(self, x_t, x_0_estimation, t_now, t_next):
+        gamma_next = self.gamma(t_next).unsqueeze(1).unsqueeze(1)
+        eps = torch.randn_like(x_0_estimation)
+        return torch.sqrt(gamma_next) * x_0_estimation + torch.sqrt(1 - gamma_next) * eps
+
     def ddim_step(self, x_t, x_0_estimation, t_now, t_next):
         gamma_now = self.gamma(t_now).unsqueeze(1).unsqueeze(1)
         gamma_next = self.gamma(t_next).unsqueeze(1).unsqueeze(1)
@@ -304,11 +309,13 @@ class Diffusion:
     def loss_t(self, x_0, t, len_mask, cond_mask):
         x_t, z, std = self.forward_diffusion(x_0, t)
 
+        x_t = self.masking(x_t)
+
         if self.normalize:
             x_t = x_t / x_t.std(dim=-1, keepdim=True)
 
-        x_noised = torch.where(cond_mask.unsqueeze(-1), torch.zeros_like(x_t), x_t)
-        x_cond = torch.where(cond_mask.unsqueeze(-1), x_t, torch.zeros_like(x_t))
+        x_noised = x_t.masked_fill(cond_mask.unsqueeze(-1), 0.0)
+        x_cond = x_t.masked_fill(~cond_mask.unsqueeze(-1), 0.0)
 
         x_estimation = torch.zeros_like(x_t)
         if self.self_conditioning and random.uniform(0, 1) < 0.5:
@@ -318,7 +325,7 @@ class Diffusion:
                 if self.interpolate is not None:
                     x_estimation = self.interpolate(latent)
 
-                x_estimation = torch.where(cond_mask.unsqueeze(-1), torch.zeros_like(x_estimation), x_estimation)
+                x_estimation = x_estimation.masked_fill(cond_mask.unsqueeze(-1), 0.0)
                 x_estimation = x_estimation.detach()
 
         x_0_estimation, latent = self.estimator(torch.cat([x_noised, x_cond, x_estimation], dim=-1), t, len_mask)
@@ -350,6 +357,8 @@ class DiffusionLM(nn.Module):
         )
         nn.init.normal_(self.embedding.weight, std=0.1)
 
+        self.mask_emb = nn.Parameter(torch.FloatTensor(self.embedding_dim).uniform_())
+
         self.estimator = TransformerModel(
             input_dim=self.embedding_dim * 3,
             target_dim=self.embedding_dim,
@@ -361,6 +370,7 @@ class DiffusionLM(nn.Module):
         self.diffusion = Diffusion(
             estimator=self.estimator,
             interpolate=self.interpolate,
+            masking=self.apply_mask,
         )
 
         self.norm_latent = nn.LayerNorm(self.model_dim)
@@ -399,12 +409,16 @@ class DiffusionLM(nn.Module):
         cossim = torch.einsum('nld,ed->nle', x, e)
         return cossim
 
+    def apply_mask(self, x):
+        batch_size, seq_length, _ = x.size()
+        token_mask = torch.rand(batch_size, seq_length, 1, device=x.device) < 0.15
+        return torch.where(token_mask, self.mask_emb, x)
+
     def compute_loss(self, ids, lengths):
         x = self.get_embeddings(ids)
         x = self.embedding_grad_scale * x + (1.0 - self.embedding_grad_scale) * x.detach()
 
         len_mask = torch.arange(ids.shape[1], device=ids.device).unsqueeze(0) < lengths.unsqueeze(1)
-        # conditional masking could be much better. if true, use original embeddings
         cond_mask = torch.rand(ids.shape, device=ids.device) < 0.1
         diff_mask = torch.logical_and(len_mask, torch.logical_not(cond_mask))
         num_elems = diff_mask.sum()
