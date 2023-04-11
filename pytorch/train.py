@@ -11,6 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from rotary_embedding_torch import RotaryEmbedding
+from ema_pytorch import EMA
+from lion_pytorch import Lion
 
 
 def get_text(path: str) -> str:
@@ -121,7 +123,7 @@ class MultiHeadAttention(nn.Module):
             q = self.rotary_emb.rotate_queries_or_keys(q)
             k = self.rotary_emb.rotate_queries_or_keys(k)
 
-        with torch.backends.cuda.sdp_kernel(enable_mem_efficient=True):
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.2)
 
         # score = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
@@ -211,7 +213,6 @@ class TransformerModel(nn.Module):
             )
             for _ in range(num_layers))
 
-        self.norm = nn.LayerNorm(model_dim)
         self.out = nn.Linear(model_dim, target_dim)
 
     def forward(self, x, t, length_mask=None):
@@ -230,7 +231,7 @@ class TransformerModel(nn.Module):
             betas = scaling_weights[4 * i + 2], scaling_weights[4 * i + 3]
             x = layer(x, length_mask, gammas=gammas, betas=betas)
 
-        return self.out(self.norm(x)), x
+        return self.out(x), x
 
 
 class Diffusion:
@@ -281,6 +282,10 @@ class Diffusion:
                 x_t = self.ddim_step(x_t, x_estimation, t_now, t_next)
             elif self.sampling_method == 'ddpm':
                 x_t = self.ddpm_step(x_t, x_estimation, t_now, t_next)
+            elif self.sampling_method == 'difflm':
+                x_t = self.ddpm_step(x_t, x_estimation, t_now, t_next)
+            else:
+                ValueError(f"Sampling method {self.sampling_method} not available.")
 
         t_final = torch.zeros(x_T.shape[0], device=x_T.device)
         _, latent = self.estimator(torch.cat([x_t, torch.zeros_like(x_t), x_estimation], dim=-1), t_final)
@@ -373,7 +378,6 @@ class DiffusionLM(nn.Module):
             masking=self.apply_mask,
         )
 
-        self.norm_latent = nn.LayerNorm(self.model_dim)
         self.dropout = nn.Dropout(p=dropout_prob)
         self.lm_head = nn.Linear(self.model_dim, self.num_embeddings)
 
@@ -385,7 +389,6 @@ class DiffusionLM(nn.Module):
         return x
 
     def get_logits(self, x):
-        x = self.norm_latent(x)
         x = self.dropout(x)
         x = self.lm_head(x)
         return x
@@ -393,8 +396,9 @@ class DiffusionLM(nn.Module):
     def interpolate(self, x):
         logits = self.get_logits(x) / self.interpolate_temperature
         weights = logits.softmax(dim=-1)
-        interpolated = torch.einsum('nle,ed->nld', weights, self.embedding.weight)
-        interpolated = F.normalize(interpolated, dim=-1) * math.sqrt(self.embedding_dim)
+        e = self.embedding.weight
+        e = F.normalize(e, dim=-1) * math.sqrt(self.embedding_dim)
+        interpolated = torch.einsum('nle,ed->nld', weights, e)
         return interpolated
 
     def dist_embedding(self, x):
@@ -459,8 +463,8 @@ def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('-ep', '--epochs', type=int, default=100)
     parser.add_argument('-b', '--batch_size', type=int, default=32)
-    parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
-    parser.add_argument('-decs', '--decay_steps', type=int, default=200000)
+    parser.add_argument('-lr', '--learning_rate', type=float, default=3e-5)
+    parser.add_argument('-decs', '--decay_steps', type=int, default=800000)
     parser.add_argument('-wd', '--weight_decay', type=float, default=1e-4)
     parser.add_argument('-acc', '--accumulation_steps', type=int, default=8)
 
@@ -468,7 +472,7 @@ def train():
     parser.add_argument('-mdim', '--model_dim', type=int, default=512)
     parser.add_argument('-numl', '--num_layers', type=int, default=8)
     parser.add_argument('-do', '--dropout_prob', type=float, default=0.1)
-    parser.add_argument('-ld', '--layerdrop_prob', type=float, default=0.05)
+    parser.add_argument('-ld', '--layerdrop_prob', type=float, default=0.0)
 
     parser.add_argument('-ckpt', '--checkpoint', type=str, required=True)
     parser.add_argument('-d', '--data_path', type=str, required=True)
@@ -480,7 +484,6 @@ def train():
 
     if torch.cuda.is_available():
         device = torch.device('cuda')
-        torch.backends.cuda.enable_mem_efficient_sdp(enabled=True)
     else:
         device = torch.device('cpu')
 
@@ -496,6 +499,13 @@ def train():
     )
     model.to(device)
 
+    ema = EMA(
+        model,
+        beta=0.9999,
+        update_after_step=100,
+        update_every=10,
+    )
+
     if os.path.exists(args.checkpoint):
         print(f"Restoring Checkpoint: {args.checkpoint}.")
         checkpoint = torch.load(args.checkpoint)
@@ -506,10 +516,15 @@ def train():
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
 
-    model.eval()
+    if 'ema_state_dict' in checkpoint:
+        ema.load_state_dict(checkpoint['ema_state_dict'])
+    else:
+        ema.copy_params_from_model_to_ema()
+
+    ema.eval()
     with torch.no_grad():
         x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
-        outputs = model(x_T).tolist()
+        outputs = ema(x_T).tolist()
         [print(text) for text in tokenizer.decode(outputs)]
 
     dataset = TextDataset(path=args.data_path, tokenizer=tokenizer)
@@ -527,12 +542,12 @@ def train():
         collate_fn=collate
     )
 
-    optim = torch.optim.AdamW(
+    optim = Lion(
         model.parameters(),
         lr=args.learning_rate,
-        betas=(0.9, 0.99),
         weight_decay=args.weight_decay
     )
+
     if 'optimizer_state_dict' in checkpoint:
         optim.load_state_dict(checkpoint['optimizer_state_dict'])
 
@@ -569,20 +584,22 @@ def train():
                 optim.step()
                 optim.zero_grad()
                 torch.cuda.empty_cache()
+                ema.update()
                 num_updates += 1
 
             if ((idx + 1) % 500 == 0) or (idx + 1 == len(dataloader)):
                 checkpoint = {
                     'num_updates': num_updates,
                     'model_state_dict': model.state_dict(),
+                    'ema_state_dict': ema.state_dict(),
                     'optimizer_state_dict': optim.state_dict()
                 }
                 torch.save(checkpoint, args.checkpoint)
 
-        model.eval()
+        ema.eval()
         with torch.no_grad():
             x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
-            outputs = model(x_T).tolist()
+            outputs = ema(x_T).tolist()
             [print(text) for text in tokenizer.decode(outputs)]
 
 
