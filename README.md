@@ -15,15 +15,17 @@ There's accompanying notes below to explain design decisions as well as referenc
 
 ### Environment Setup:
 
-Aside from PyTorch, the training script requires `tqdm` and three other packages;
+Aside from PyTorch, the training script requires `tqdm` and four other packages;
 [SentencePiece](https://github.com/google/sentencepiece), 
 [RotaryEmbedding](https://github.com/lucidrains/rotary-embedding-torch), 
+[Lion](https://github.com/lucidrains/lion-pytorch), 
 and [EMA](https://github.com/lucidrains/ema-pytorch).
 They can be installed with the following commands:
 
 ```commandline
 pip install sentencepiece
 pip install rotary-embedding-torch
+pip install lion-pytorch
 pip install ema-pytorch
 pip install tqdm
 ```

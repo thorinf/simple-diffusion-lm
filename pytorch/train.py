@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from rotary_embedding_torch import RotaryEmbedding
 from ema_pytorch import EMA
+from lion_pytorch import Lion
+
 
 
 def get_text(path: str) -> str:
@@ -516,9 +518,9 @@ def train():
     if 'ema_state_dict' in checkpoint:
         ema.load_state_dict(checkpoint['ema_state_dict'])
     else:
-        ema.update()
+        ema.copy_params_from_model_to_ema()
 
-    model.eval()
+    ema.eval()
     with torch.no_grad():
         x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
         outputs = ema(x_T).tolist()
@@ -539,12 +541,12 @@ def train():
         collate_fn=collate
     )
 
-    optim = torch.optim.AdamW(
+    optim = Lion(
         model.parameters(),
         lr=args.learning_rate,
-        betas=(0.9, 0.99),
         weight_decay=args.weight_decay
     )
+
     if 'optimizer_state_dict' in checkpoint:
         optim.load_state_dict(checkpoint['optimizer_state_dict'])
 
@@ -593,7 +595,7 @@ def train():
                 }
                 torch.save(checkpoint, args.checkpoint)
 
-        model.eval()
+        ema.eval()
         with torch.no_grad():
             x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
             outputs = ema(x_T).tolist()
