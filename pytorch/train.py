@@ -15,7 +15,6 @@ from ema_pytorch import EMA
 from lion_pytorch import Lion
 
 
-
 def get_text(path: str) -> str:
     with open(path, "r", encoding='utf-8') as file:
         return file.read()
@@ -214,7 +213,6 @@ class TransformerModel(nn.Module):
             )
             for _ in range(num_layers))
 
-        self.norm = nn.LayerNorm(model_dim)
         self.out = nn.Linear(model_dim, target_dim)
 
     def forward(self, x, t, length_mask=None):
@@ -233,7 +231,7 @@ class TransformerModel(nn.Module):
             betas = scaling_weights[4 * i + 2], scaling_weights[4 * i + 3]
             x = layer(x, length_mask, gammas=gammas, betas=betas)
 
-        return self.out(self.norm(x)), x
+        return self.out(x), x
 
 
 class Diffusion:
@@ -284,6 +282,10 @@ class Diffusion:
                 x_t = self.ddim_step(x_t, x_estimation, t_now, t_next)
             elif self.sampling_method == 'ddpm':
                 x_t = self.ddpm_step(x_t, x_estimation, t_now, t_next)
+            elif self.sampling_method == 'difflm':
+                x_t = self.ddpm_step(x_t, x_estimation, t_now, t_next)
+            else:
+                ValueError(f"Sampling method {self.sampling_method} not available.")
 
         t_final = torch.zeros(x_T.shape[0], device=x_T.device)
         _, latent = self.estimator(torch.cat([x_t, torch.zeros_like(x_t), x_estimation], dim=-1), t_final)
@@ -376,7 +378,6 @@ class DiffusionLM(nn.Module):
             masking=self.apply_mask,
         )
 
-        self.norm_latent = nn.LayerNorm(self.model_dim)
         self.dropout = nn.Dropout(p=dropout_prob)
         self.lm_head = nn.Linear(self.model_dim, self.num_embeddings)
 
@@ -388,7 +389,6 @@ class DiffusionLM(nn.Module):
         return x
 
     def get_logits(self, x):
-        x = self.norm_latent(x)
         x = self.dropout(x)
         x = self.lm_head(x)
         return x
@@ -396,8 +396,9 @@ class DiffusionLM(nn.Module):
     def interpolate(self, x):
         logits = self.get_logits(x) / self.interpolate_temperature
         weights = logits.softmax(dim=-1)
-        interpolated = torch.einsum('nle,ed->nld', weights, self.embedding.weight)
-        interpolated = F.normalize(interpolated, dim=-1) * math.sqrt(self.embedding_dim)
+        e = self.embedding.weight
+        e = F.normalize(e, dim=-1) * math.sqrt(self.embedding_dim)
+        interpolated = torch.einsum('nle,ed->nld', weights, e)
         return interpolated
 
     def dist_embedding(self, x):
@@ -462,7 +463,7 @@ def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('-ep', '--epochs', type=int, default=100)
     parser.add_argument('-b', '--batch_size', type=int, default=32)
-    parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
+    parser.add_argument('-lr', '--learning_rate', type=float, default=3e-5)
     parser.add_argument('-decs', '--decay_steps', type=int, default=800000)
     parser.add_argument('-wd', '--weight_decay', type=float, default=1e-4)
     parser.add_argument('-acc', '--accumulation_steps', type=int, default=8)
