@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from rotary_embedding_torch import RotaryEmbedding
+from ema_pytorch import EMA
 
 
 def get_text(path: str) -> str:
@@ -121,7 +122,7 @@ class MultiHeadAttention(nn.Module):
             q = self.rotary_emb.rotate_queries_or_keys(q)
             k = self.rotary_emb.rotate_queries_or_keys(k)
 
-        with torch.backends.cuda.sdp_kernel(enable_mem_efficient=True):
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.2)
 
         # score = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
@@ -460,7 +461,7 @@ def train():
     parser.add_argument('-ep', '--epochs', type=int, default=100)
     parser.add_argument('-b', '--batch_size', type=int, default=32)
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
-    parser.add_argument('-decs', '--decay_steps', type=int, default=200000)
+    parser.add_argument('-decs', '--decay_steps', type=int, default=800000)
     parser.add_argument('-wd', '--weight_decay', type=float, default=1e-4)
     parser.add_argument('-acc', '--accumulation_steps', type=int, default=8)
 
@@ -468,7 +469,7 @@ def train():
     parser.add_argument('-mdim', '--model_dim', type=int, default=512)
     parser.add_argument('-numl', '--num_layers', type=int, default=8)
     parser.add_argument('-do', '--dropout_prob', type=float, default=0.1)
-    parser.add_argument('-ld', '--layerdrop_prob', type=float, default=0.05)
+    parser.add_argument('-ld', '--layerdrop_prob', type=float, default=0.0)
 
     parser.add_argument('-ckpt', '--checkpoint', type=str, required=True)
     parser.add_argument('-d', '--data_path', type=str, required=True)
@@ -480,7 +481,6 @@ def train():
 
     if torch.cuda.is_available():
         device = torch.device('cuda')
-        torch.backends.cuda.enable_mem_efficient_sdp(enabled=True)
     else:
         device = torch.device('cpu')
 
@@ -496,6 +496,13 @@ def train():
     )
     model.to(device)
 
+    ema = EMA(
+        model,
+        beta=0.9999,
+        update_after_step=100,
+        update_every=10,
+    )
+
     if os.path.exists(args.checkpoint):
         print(f"Restoring Checkpoint: {args.checkpoint}.")
         checkpoint = torch.load(args.checkpoint)
@@ -506,10 +513,15 @@ def train():
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
 
+    if 'ema_state_dict' in checkpoint:
+        ema.load_state_dict(checkpoint['ema_state_dict'])
+    else:
+        ema.update()
+
     model.eval()
     with torch.no_grad():
         x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
-        outputs = model(x_T).tolist()
+        outputs = ema(x_T).tolist()
         [print(text) for text in tokenizer.decode(outputs)]
 
     dataset = TextDataset(path=args.data_path, tokenizer=tokenizer)
@@ -569,12 +581,14 @@ def train():
                 optim.step()
                 optim.zero_grad()
                 torch.cuda.empty_cache()
+                ema.update()
                 num_updates += 1
 
             if ((idx + 1) % 500 == 0) or (idx + 1 == len(dataloader)):
                 checkpoint = {
                     'num_updates': num_updates,
                     'model_state_dict': model.state_dict(),
+                    'ema_state_dict': ema.state_dict(),
                     'optimizer_state_dict': optim.state_dict()
                 }
                 torch.save(checkpoint, args.checkpoint)
@@ -582,7 +596,7 @@ def train():
         model.eval()
         with torch.no_grad():
             x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
-            outputs = model(x_T).tolist()
+            outputs = ema(x_T).tolist()
             [print(text) for text in tokenizer.decode(outputs)]
 
 
