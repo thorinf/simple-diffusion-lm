@@ -283,7 +283,7 @@ class Diffusion:
             elif self.sampling_method == 'ddpm':
                 x_t = self.ddpm_step(x_t, x_estimation, t_now, t_next)
             elif self.sampling_method == 'difflm':
-                x_t = self.ddpm_step(x_t, x_estimation, t_now, t_next)
+                x_t = self.diff_lm_step(x_t, x_estimation, t_now, t_next)
             else:
                 ValueError(f"Sampling method {self.sampling_method} not available.")
 
