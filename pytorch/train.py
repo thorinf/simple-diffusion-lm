@@ -124,7 +124,7 @@ class MultiHeadAttention(nn.Module):
             k = self.rotary_emb.rotate_queries_or_keys(k)
 
         with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.2)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.2 if self.training else 0.0)
 
         # score = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         # if mask is not None:
@@ -283,7 +283,7 @@ class Diffusion:
             elif self.sampling_method == 'ddpm':
                 x_t = self.ddpm_step(x_t, x_estimation, t_now, t_next)
             elif self.sampling_method == 'difflm':
-                x_t = self.ddpm_step(x_t, x_estimation, t_now, t_next)
+                x_t = self.diff_lm_step(x_t, x_estimation, t_now, t_next)
             else:
                 ValueError(f"Sampling method {self.sampling_method} not available.")
 
@@ -314,7 +314,8 @@ class Diffusion:
     def loss_t(self, x_0, t, len_mask, cond_mask):
         x_t, z, std = self.forward_diffusion(x_0, t)
 
-        x_t = self.masking(x_t)
+        if self.masking is not None:
+            x_t = self.masking(x_t)
 
         if self.normalize:
             x_t = x_t / x_t.std(dim=-1, keepdim=True)
@@ -375,7 +376,6 @@ class DiffusionLM(nn.Module):
         self.diffusion = Diffusion(
             estimator=self.estimator,
             interpolate=self.interpolate,
-            masking=self.apply_mask,
         )
 
         self.dropout = nn.Dropout(p=dropout_prob)
