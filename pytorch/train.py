@@ -120,8 +120,8 @@ class MultiHeadAttention(nn.Module):
         v = v.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.rotary_emb is not None:
-            q = self.rotary_emb.rotate_queries_or_keys(q)
-            k = self.rotary_emb.rotate_queries_or_keys(k)
+            q = self.rotary_emb.rotate_queries_or_keys(q, seq_dim=2)
+            k = self.rotary_emb.rotate_queries_or_keys(k, seq_dim=2)
 
         with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.2 if self.training else 0.0)
@@ -144,7 +144,7 @@ class TransformerEncoderLayer(nn.Module):
         self.attention = MultiHeadAttention(
             dim=dim,
             num_heads=num_heads,
-            qkv_bias=True,
+            qkv_bias=False,
             rotary_embedding=RotaryEmbedding(dim=32)
         )
         self.dropout1 = nn.Dropout(p=drop_prob)
@@ -362,6 +362,7 @@ class DiffusionLM(nn.Module):
             embedding_dim=self.embedding_dim
         )
         nn.init.normal_(self.embedding.weight, std=0.1)
+        self.norm = nn.LayerNorm(self.embedding_dim)
 
         self.mask_emb = nn.Parameter(torch.FloatTensor(self.embedding_dim).uniform_())
 
@@ -384,9 +385,9 @@ class DiffusionLM(nn.Module):
         self.loss_ce = nn.CrossEntropyLoss(reduction='none')
 
     def get_embeddings(self, ids):
-        x = self.embedding(ids)
-        x = F.normalize(x, dim=-1) * math.sqrt(self.embedding_dim)
-        return x
+        e = self.embedding(ids)
+        e = self.norm(e)
+        return e
 
     def get_logits(self, x):
         x = self.dropout(x)
@@ -397,13 +398,13 @@ class DiffusionLM(nn.Module):
         logits = self.get_logits(x) / self.interpolate_temperature
         weights = logits.softmax(dim=-1)
         e = self.embedding.weight
-        e = F.normalize(e, dim=-1) * math.sqrt(self.embedding_dim)
+        e = self.norm(e)
         interpolated = torch.einsum('nle,ed->nld', weights, e)
         return interpolated
 
     def dist_embedding(self, x):
         e = self.embedding.weight
-        e = F.normalize(e, dim=-1) * math.sqrt(self.embedding_dim)
+        e = self.norm(e)
         return torch.cdist(x, e)
 
     def cosine_similarity(self, x):
@@ -580,7 +581,7 @@ def train():
 
             if ((idx + 1) % args.accumulation_steps == 0) or (idx + 1 == len(dataloader)):
                 optim.param_groups[0]['lr'] = lr_lambda(num_updates)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optim.step()
                 optim.zero_grad()
                 torch.cuda.empty_cache()
