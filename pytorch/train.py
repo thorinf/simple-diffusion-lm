@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from rotary_embedding_torch import RotaryEmbedding
 from ema_pytorch import EMA
-from lion_pytorch import Lion
 
 
 def get_text(path: str) -> str:
@@ -179,7 +178,7 @@ class LearnedSinusoidalPosEmb(nn.Module):
 
     def forward(self, x):
         freq = torch.einsum('b,d->bd', x, self.weights) * 2 * math.pi
-        return torch.cat([x.unsqueeze(-1), freq.sin(), freq.cos()], dim=-1)
+        return torch.cat([freq.sin(), freq.cos()], dim=-1)
 
 
 class TransformerModel(nn.Module):
@@ -192,7 +191,7 @@ class TransformerModel(nn.Module):
 
         self.time_mlp = nn.Sequential(
             LearnedSinusoidalPosEmb(learned_sinusoidal_dim),
-            nn.Linear(learned_sinusoidal_dim + 1, 128),
+            nn.Linear(learned_sinusoidal_dim, 128),
             nn.GELU(),
             nn.Dropout(p=dropout_prob),
             nn.Linear(128, num_layers * 4 * model_dim),
@@ -236,7 +235,7 @@ class TransformerModel(nn.Module):
 
 class Diffusion:
     def __init__(self, estimator: nn.Module, interpolate=None, self_conditioning=True, normalize=False, masking=None,
-                 sampling_method='ddpm'):
+                 sampling_method='difflm'):
         super(Diffusion).__init__()
         self.estimator = estimator
         self.interpolate = interpolate
@@ -311,11 +310,13 @@ class Diffusion:
         eps = torch.rsqrt(1 - gamma_now) * (x_t - torch.sqrt(gamma_now) * x_0_estimation)
         return torch.rsqrt(alpha_now) * (x_t - (1 - alpha_now) * torch.rsqrt(1 - gamma_now) * eps) + std_now * z
 
-    def loss_t(self, x_0, t, len_mask, cond_mask):
-        x_t, z, std = self.forward_diffusion(x_0, t)
+    def loss_t(self, x, t, len_mask, cond_mask):
+        x_target = x.detach()
 
         if self.masking is not None:
-            x_t = self.masking(x_t)
+            x = self.masking(x)
+
+        x_t, z, std = self.forward_diffusion(x, t)
 
         if self.normalize:
             x_t = x_t / x_t.std(dim=-1, keepdim=True)
@@ -334,10 +335,9 @@ class Diffusion:
                 x_estimation = x_estimation.masked_fill(cond_mask.unsqueeze(-1), 0.0)
                 x_estimation = x_estimation.detach()
 
-        x_0_estimation, latent = self.estimator(torch.cat([x_noised, x_cond, x_estimation], dim=-1), t, len_mask)
+        x_estimation, latent = self.estimator(torch.cat([x_noised, x_cond, x_estimation], dim=-1), t, len_mask)
 
-        loss = (x_0 - x_0_estimation) ** 2.0
-        return loss, x_0_estimation, latent
+        return ((x_estimation - x_target) ** 2.0).mean(-1), x_estimation, latent
 
     def compute_loss(self, x_0, len_mask, cond_mask, offset=1e-5):
         t = torch.rand(x_0.shape[0], dtype=x_0.dtype, device=x_0.device, requires_grad=False)
@@ -419,6 +419,11 @@ class DiffusionLM(nn.Module):
         token_mask = torch.rand(batch_size, seq_length, 1, device=x.device) < 0.15
         return torch.where(token_mask, self.mask_emb, x)
 
+    @torch.no_grad()
+    def clip_critic(self, clip_value=0.01):
+        for param in self.lm_head.parameters():
+            param.clamp_(-clip_value, clip_value)
+
     def compute_loss(self, ids, lengths):
         x = self.get_embeddings(ids)
         x = self.embedding_grad_scale * x + (1.0 - self.embedding_grad_scale) * x.detach()
@@ -428,7 +433,7 @@ class DiffusionLM(nn.Module):
         diff_mask = torch.logical_and(len_mask, torch.logical_not(cond_mask))
         num_elems = diff_mask.sum()
 
-        loss_diff, x_0_estimation, latent = self.diffusion.compute_loss(x, len_mask, cond_mask)
+        loss_diff, x_estimation, latent = self.diffusion.compute_loss(x, len_mask, cond_mask)
         loss_diff = loss_diff[diff_mask].mean(-1)
 
         logits = self.get_logits(latent)
@@ -445,7 +450,7 @@ class DiffusionLM(nn.Module):
 
     @torch.no_grad()
     def forward(self, z):
-        x_0, latent = self.diffusion.reverse_diffusion(z, 200, 0.0)
+        x, latent = self.diffusion.reverse_diffusion(z, 200, 0.0)
         return self.get_logits(latent).argmax(dim=-1)
 
 
@@ -464,10 +469,12 @@ def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('-ep', '--epochs', type=int, default=100)
     parser.add_argument('-b', '--batch_size', type=int, default=32)
-    parser.add_argument('-lr', '--learning_rate', type=float, default=3e-5)
+    parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
+    parser.add_argument('-wup', '--warmup_steps', type=int, default=2000)
     parser.add_argument('-decs', '--decay_steps', type=int, default=800000)
     parser.add_argument('-wd', '--weight_decay', type=float, default=1e-4)
     parser.add_argument('-acc', '--accumulation_steps', type=int, default=8)
+    parser.add_argument('-crtc', '--clip_critic', type=bool, default=True)
 
     parser.add_argument('-edim', '--embedding_dim', type=int, default=64)
     parser.add_argument('-mdim', '--model_dim', type=int, default=512)
@@ -515,7 +522,7 @@ def train():
         checkpoint = {}
 
     if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
 
     if 'ema_state_dict' in checkpoint:
         ema.load_state_dict(checkpoint['ema_state_dict'])
@@ -533,7 +540,7 @@ def train():
         crop_length=args.crop_length,
         eos_id=tokenizer.eos_id,
         pad_id=tokenizer.pad_id,
-        length_includes_pad=False
+        length_includes_pad=True
     )
     dataloader = DataLoader(
         dataset,
@@ -543,17 +550,18 @@ def train():
         collate_fn=collate
     )
 
-    optim = Lion(
+    optim = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
+        betas=(0.9, 0.99),
         weight_decay=args.weight_decay
     )
 
     if 'optimizer_state_dict' in checkpoint:
         optim.load_state_dict(checkpoint['optimizer_state_dict'])
 
-    num_updates = checkpoint.get('num_updates', 0)
-    lr_lambda = lambda step: linear_decay_with_warmup(step, args.learning_rate, 2000, 0, args.decay_steps,
+    global_step = checkpoint.get('global_step', 0)
+    lr_lambda = lambda step: linear_decay_with_warmup(step, args.learning_rate, args.warmup_steps, 0, args.decay_steps,
                                                       args.learning_rate * 0.1)
 
     for ep in range(0, args.epochs):
@@ -580,17 +588,21 @@ def train():
                 ValueError("Loss is not finite, backward pass not computed.")
 
             if ((idx + 1) % args.accumulation_steps == 0) or (idx + 1 == len(dataloader)):
-                optim.param_groups[0]['lr'] = lr_lambda(num_updates)
+                optim.param_groups[0]['lr'] = lr_lambda(global_step)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optim.step()
+
+                if args.clip_critic:
+                    model.clip_critic()
+
                 optim.zero_grad()
                 torch.cuda.empty_cache()
                 ema.update()
-                num_updates += 1
+                global_step += 1
 
             if ((idx + 1) % 500 == 0) or (idx + 1 == len(dataloader)):
                 checkpoint = {
-                    'num_updates': num_updates,
+                    'global_step': global_step,
                     'model_state_dict': model.state_dict(),
                     'ema_state_dict': ema.state_dict(),
                     'optimizer_state_dict': optim.state_dict()
