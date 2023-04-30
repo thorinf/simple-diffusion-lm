@@ -123,13 +123,12 @@ class MultiHeadAttention(nn.Module):
             k = self.rotary_emb.rotate_queries_or_keys(k, seq_dim=2)
 
         with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.2 if self.training else 0.0)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.1 if self.training else 0.0)
 
         # score = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         # if mask is not None:
         #     score = score.masked_fill(mask == 0, -1e9)
         # score = F.softmax(score, dim=-1)
-        # score = self.dropout_att(score)
         # out = score @ v
 
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_length, self.model_dim)
@@ -327,7 +326,8 @@ class Diffusion:
         x_estimation = torch.zeros_like(x_t)
         if self.self_conditioning and random.uniform(0, 1) < 0.5:
             with torch.no_grad():
-                x_estimation, latent = self.estimator(torch.cat([x_noised, x_cond, x_estimation], dim=-1), t, len_mask)
+                x_estimation, latent = self.estimator(torch.cat([x_noised, x_cond, x_estimation], dim=-1), t,
+                                                      len_mask)
 
                 if self.interpolate is not None:
                     x_estimation = self.interpolate(latent)
@@ -434,7 +434,7 @@ class DiffusionLM(nn.Module):
         num_elems = diff_mask.sum()
 
         loss_diff, x_estimation, latent = self.diffusion.compute_loss(x, len_mask, cond_mask)
-        loss_diff = loss_diff[diff_mask].mean(-1)
+        loss_diff = loss_diff.masked_fill(~diff_mask, 0.0)
 
         logits = self.get_logits(latent)
         ids = ids.masked_fill(torch.logical_not(diff_mask), -100)
@@ -442,7 +442,7 @@ class DiffusionLM(nn.Module):
 
         accuracy = (logits.argmax(dim=-1) == ids).float().sum() / num_elems
 
-        loss_diff = loss_diff.mean()
+        loss_diff = loss_diff.sum() / num_elems
         loss_reconstruction = loss_reconstruction.sum() / num_elems
         loss = loss_diff + loss_reconstruction
 
@@ -468,12 +468,12 @@ def linear_decay_with_warmup(step, max_learning_rate, warmup_steps, hold_steps, 
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('-ep', '--epochs', type=int, default=100)
-    parser.add_argument('-b', '--batch_size', type=int, default=32)
+    parser.add_argument('-b', '--batch_size', type=int, default=256)
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
     parser.add_argument('-wup', '--warmup_steps', type=int, default=2000)
     parser.add_argument('-decs', '--decay_steps', type=int, default=800000)
     parser.add_argument('-wd', '--weight_decay', type=float, default=1e-4)
-    parser.add_argument('-acc', '--accumulation_steps', type=int, default=8)
+    parser.add_argument('-acc', '--accumulation_steps', type=int, default=1)
     parser.add_argument('-crtc', '--clip_critic', type=bool, default=True)
 
     parser.add_argument('-edim', '--embedding_dim', type=int, default=64)
@@ -570,6 +570,7 @@ def train():
         pbar.set_description(f"epoch: {ep}")
 
         for idx, (ids, lengths) in enumerate(pbar):
+
             ids = ids.to(device)
             lengths = lengths.to(device)
 
@@ -582,10 +583,7 @@ def train():
                 "accuracy": accuracy.item(),
             })
 
-            if torch.isfinite(loss):
-                (loss / args.accumulation_steps).backward()
-            else:
-                ValueError("Loss is not finite, backward pass not computed.")
+            (loss / args.accumulation_steps).backward()
 
             if ((idx + 1) % args.accumulation_steps == 0) or (idx + 1 == len(dataloader)):
                 optim.param_groups[0]['lr'] = lr_lambda(global_step)
@@ -596,7 +594,6 @@ def train():
                     model.clip_critic()
 
                 optim.zero_grad()
-                torch.cuda.empty_cache()
                 ema.update()
                 global_step += 1
 
