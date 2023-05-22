@@ -70,27 +70,74 @@ class TextDataset(torch.utils.data.Dataset):
 
 
 class Collate:
-    def __init__(self, crop_length=-1, eos_id=-1, pad_id=-1, length_includes_pad=False):
+    def __init__(self, crop_length=-1, eos_id=-1, pad_id=-1, length_includes_pad=False, fold_size=None):
         assert not (pad_id < 0 and length_includes_pad)
+        assert not (pad_id < 0 and fold_size)
         self.crop_length = crop_length
+        self.fold_size = fold_size
         self.eos_id = eos_id
         self.pad_id = pad_id
+        self.pad_insert_rate = 0.0
         self.length_includes_pad = length_includes_pad
 
+    def fold(self, ids):
+        # pad the list for folding
+        remainder = len(ids) % self.fold_size
+        if remainder != 0:
+            ids += [self.pad_id] * (self.fold_size - remainder)
+        # fold the list
+        ids = [ids[i:i + self.fold_size] for i in range(0, len(ids), self.fold_size)]
+        return ids
+
+    def generate_mask(self, length):
+        conditional_mask = [False] * length
+        mask_span_length = random.randint(0, length - 1)
+        start_index = random.randint(0, length - mask_span_length)
+        conditional_mask[start_index:start_index + mask_span_length] = [True] * mask_span_length
+        # half of the masks will be completely random
+        if random.random() < 0.5:
+            random.shuffle(conditional_mask)
+        return conditional_mask
+
+    def process_ids(self, ids):
+        # and the eos token
+        if self.eos_id >= 0:
+            ids.append(self.eos_id)
+        # randomly insert pads into ids
+        if self.pad_id >= 0 and self.pad_insert_rate > 0:
+            pad_count = int(len(ids) * self.pad_insert_rate)
+            pad_indices = random.sample(range(len(ids)), pad_count)
+            for index in pad_indices:
+                ids.insert(index, self.pad_id)
+        if self.fold_size is not None:
+            ids = self.fold(ids)
+        # crops the length
+        if 0 < self.crop_length < len(ids):
+            ids = ids[:self.crop_length]
+        # create a conditional mask
+        conditional_mask = self.generate_mask(len(ids))
+        return ids, len(ids), conditional_mask
+
     def __call__(self, batch):
-        ids_end = [self.eos_id] if self.eos_id >= 0 else []
-        ids_list = [torch.tensor(ids + ids_end, dtype=torch.int64) for ids in batch]
-        ids = torch.nn.utils.rnn.pad_sequence(ids_list, batch_first=True, padding_value=self.pad_id)
-        lengths = torch.tensor([x.shape[0] for x in ids_list])
+        processed = list(map(self.process_ids, batch))
+        ids, lengths, conditional_mask = zip(*processed)
 
-        if 0 < self.crop_length < ids.shape[1]:
-            ids = ids[:, :self.crop_length]
-            lengths = torch.minimum(lengths, torch.tensor(self.crop_length))
+        # sample a random amount of padding
+        padded_lengths = [random.randint(length, max(lengths)) for length in lengths]
+        lengths = torch.tensor(padded_lengths) if self.length_includes_pad else torch.tensor(lengths)
 
-        if self.length_includes_pad:
-            lengths = torch.full_like(lengths, lengths.max())
+        ids = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(x, dtype=torch.int64) for x in ids],
+            batch_first=True,
+            padding_value=self.pad_id
+        )
+        conditional_mask = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(x, dtype=torch.bool) for x in conditional_mask],
+            batch_first=True,
+            padding_value=False
+        )
 
-        return ids, lengths
+        return ids, lengths, conditional_mask
 
 
 class MultiHeadAttention(nn.Module):
@@ -320,7 +367,7 @@ class Diffusion:
             x_t = x_t / x_t.std(dim=-1, keepdim=True)
 
         x_noised = x_t.masked_fill(cond_mask.unsqueeze(-1), 0.0)
-        x_cond = x_t.masked_fill(~cond_mask.unsqueeze(-1), 0.0)
+        x_cond = x.masked_fill(~cond_mask.unsqueeze(-1), 0.0)
 
         x_estimation = torch.zeros_like(x_t)
         if self.self_conditioning and random.uniform(0, 1) < 0.5:
@@ -423,17 +470,17 @@ class DiffusionLM(nn.Module):
         for param in self.lm_head.parameters():
             param.clamp_(-clip_value, clip_value)
 
-    def compute_loss(self, ids, lengths):
+    def compute_loss(self, ids, lengths, conditional_mask=None):
         x = self.get_embeddings(ids)
         x = self.embedding_grad_scale * x + (1.0 - self.embedding_grad_scale) * x.detach()
 
-        len_mask = torch.arange(ids.shape[1], device=ids.device).unsqueeze(0) < lengths.unsqueeze(1)
-        cond_mask = torch.rand(ids.shape, device=ids.device) < 0.1
-        diff_mask = torch.logical_and(len_mask, torch.logical_not(cond_mask))
+        length_mask = torch.arange(ids.shape[1], device=ids.device).unsqueeze(0) < lengths.unsqueeze(1)
+        diff_mask = torch.logical_and(length_mask, torch.logical_not(conditional_mask))
         num_elems = diff_mask.sum()
 
-        loss_diff, x_estimation, latent = self.diffusion.compute_loss(x, len_mask, cond_mask)
-        loss_diff = loss_diff.masked_fill(~diff_mask, 0.0)
+        loss_diff, x_estimation, latent = self.diffusion.compute_loss(x, length_mask, conditional_mask)
+        loss_diff = loss_diff * diff_mask
+        loss_diff = loss_diff.sum() / num_elems
 
         logits = self.get_logits(latent)
         ids = ids.masked_fill(torch.logical_not(diff_mask), -100)
@@ -516,6 +563,12 @@ def train():
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
 
+    model.eval()
+    with torch.no_grad():
+        x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
+        outputs = model(x_T).tolist()
+        [print(tokenizer.decode(encoded)) for encoded in outputs]
+
     dataset = TextDataset(path=args.data_path, tokenizer=tokenizer)
     collate = Collate(
         crop_length=args.crop_length,
@@ -550,12 +603,11 @@ def train():
         pbar = tqdm(dataloader)
         pbar.set_description(f"epoch: {ep}")
 
-        for idx, (ids, lengths) in enumerate(pbar):
+        for idx, (ids, lengths, conditional_mask) in enumerate(pbar):
 
-            ids = ids.to(device)
-            lengths = lengths.to(device)
+            ids, lengths, conditional_mask = ids.to(device), lengths.to(device), conditional_mask.to(device)
 
-            loss, loss_diff, loss_reconstruction, accuracy = model.compute_loss(ids, lengths)
+            loss, loss_diff, loss_reconstruction, accuracy = model.compute_loss(ids, lengths, conditional_mask)
 
             pbar.set_postfix({
                 "loss": loss.item(),
