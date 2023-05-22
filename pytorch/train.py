@@ -11,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from rotary_embedding_torch import RotaryEmbedding
-from ema_pytorch import EMA
 
 
 def get_text(path: str) -> str:
@@ -507,13 +506,6 @@ def train():
     )
     model.to(device)
 
-    ema = EMA(
-        model,
-        beta=0.9999,
-        update_after_step=100,
-        update_every=10,
-    )
-
     if os.path.exists(args.checkpoint):
         print(f"Restoring Checkpoint: {args.checkpoint}.")
         checkpoint = torch.load(args.checkpoint)
@@ -523,17 +515,6 @@ def train():
 
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-
-    if 'ema_state_dict' in checkpoint:
-        ema.load_state_dict(checkpoint['ema_state_dict'])
-    else:
-        ema.copy_params_from_model_to_ema()
-
-    ema.eval()
-    with torch.no_grad():
-        x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
-        outputs = ema(x_T).tolist()
-        [print(text) for text in tokenizer.decode(outputs)]
 
     dataset = TextDataset(path=args.data_path, tokenizer=tokenizer)
     collate = Collate(
@@ -594,23 +575,21 @@ def train():
                     model.clip_critic()
 
                 optim.zero_grad()
-                ema.update()
                 global_step += 1
 
             if ((idx + 1) % 500 == 0) or (idx + 1 == len(dataloader)):
                 checkpoint = {
                     'global_step': global_step,
                     'model_state_dict': model.state_dict(),
-                    'ema_state_dict': ema.state_dict(),
                     'optimizer_state_dict': optim.state_dict()
                 }
                 torch.save(checkpoint, args.checkpoint)
 
-        ema.eval()
+        model.eval()
         with torch.no_grad():
             x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
-            outputs = ema(x_T).tolist()
-            [print(text) for text in tokenizer.decode(outputs)]
+            outputs = model(x_T).tolist()
+            [print(tokenizer.decode(encoded)) for encoded in outputs]
 
 
 if __name__ == "__main__":
