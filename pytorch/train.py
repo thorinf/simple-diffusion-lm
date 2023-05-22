@@ -301,16 +301,13 @@ class Diffusion:
         return x_t, z, std
 
     @torch.no_grad()
-    def reverse_diffusion(self, x_T, steps, td=0.0):
+    def reverse_diffusion(self, x_T, steps):
         x_t = x_T
         x_estimation = torch.zeros_like(x_t)
 
-        for step in range(steps):
-            t_now = 1 - step / steps
-            t_next = max(1 - (step + 1 + td) / steps, 0)
-            t_now = torch.tensor(t_now, device=x_t.device).repeat(x_T.shape[0])
-            t_next = torch.tensor(t_next, device=x_t.device).repeat(x_T.shape[0])
+        t_now = torch.ones(x_T.shape[0], dtype=x_t.dtype, device=x_t.device, requires_grad=False)
 
+        for step in range(steps):
             if not self.self_conditioning:
                 x_estimation = torch.zeros_like(x_t)
 
@@ -322,6 +319,8 @@ class Diffusion:
             if self.interpolate is not None:
                 x_estimation = self.interpolate(latent)
 
+            t_next = torch.clamp(t_now - 1 / steps, 0.0, 1.0)
+
             if self.sampling_method == 'ddim':
                 x_t = self.ddim_step(x_t, x_estimation, t_now, t_next)
             elif self.sampling_method == 'ddpm':
@@ -330,6 +329,8 @@ class Diffusion:
                 x_t = self.diff_lm_step(x_t, x_estimation, t_now, t_next)
             else:
                 ValueError(f"Sampling method {self.sampling_method} not available.")
+
+            t_now = t_next
 
         t_final = torch.zeros(x_T.shape[0], device=x_T.device)
         _, latent = self.estimator(torch.cat([x_t, torch.zeros_like(x_t), x_estimation], dim=-1), t_final)
@@ -496,7 +497,7 @@ class DiffusionLM(nn.Module):
 
     @torch.no_grad()
     def forward(self, z):
-        x, latent = self.diffusion.reverse_diffusion(z, 200, 0.0)
+        x, latent = self.diffusion.reverse_diffusion(z, 200)
         return self.get_logits(latent).argmax(dim=-1)
 
 
