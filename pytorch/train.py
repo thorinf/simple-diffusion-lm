@@ -281,14 +281,13 @@ class TransformerModel(nn.Module):
 
 
 class Diffusion:
-    def __init__(self, estimator: nn.Module, interpolate=None, self_conditioning=True, normalize=False, masking=None,
+    def __init__(self, estimator: nn.Module, interpolate=None, self_conditioning=True, normalize=False,
                  sampling_method='difflm'):
         super(Diffusion).__init__()
         self.estimator = estimator
         self.interpolate = interpolate
         self.self_conditioning = self_conditioning
         self.normalize = normalize
-        self.masking = masking
         self.sampling_method = sampling_method
 
     def gamma(self, t, ns=0.0002, ds=0.00025):
@@ -361,9 +360,6 @@ class Diffusion:
     def loss_t(self, x, t, len_mask, cond_mask):
         x_target = x.detach()
 
-        if self.masking is not None:
-            x = self.masking(x)
-
         x_t, z, std = self.forward_diffusion(x, t)
 
         if self.normalize:
@@ -410,10 +406,7 @@ class DiffusionLM(nn.Module):
             num_embeddings=self.num_embeddings,
             embedding_dim=self.embedding_dim
         )
-        nn.init.normal_(self.embedding.weight, std=0.1)
         self.norm = nn.LayerNorm(self.embedding_dim)
-
-        self.mask_emb = nn.Parameter(torch.FloatTensor(self.embedding_dim).uniform_())
 
         self.estimator = TransformerModel(
             input_dim=self.embedding_dim * 3,
@@ -474,16 +467,6 @@ class DiffusionLM(nn.Module):
         cossim = torch.einsum('nld,ed->nle', x, e)
         return cossim
 
-    def apply_mask(self, x):
-        batch_size, seq_length, _ = x.size()
-        token_mask = torch.rand(batch_size, seq_length, 1, device=x.device) < 0.15
-        return torch.where(token_mask, self.mask_emb, x)
-
-    @torch.no_grad()
-    def clip_critic(self, clip_value=0.01):
-        for param in self.lm_head.parameters():
-            param.clamp_(-clip_value, clip_value)
-
     def compute_loss(self, ids, lengths, conditional_mask=None):
         x = self.get_embeddings(ids)
         x = self.embedding_grad_scale * x + (1.0 - self.embedding_grad_scale) * x.detach()
@@ -533,7 +516,6 @@ def train():
     parser.add_argument('-decs', '--decay_steps', type=int, default=800000)
     parser.add_argument('-wd', '--weight_decay', type=float, default=1e-4)
     parser.add_argument('-acc', '--accumulation_steps', type=int, default=1)
-    parser.add_argument('-crtc', '--clip_critic', type=bool, default=True)
 
     parser.add_argument('-edim', '--embedding_dim', type=int, default=64)
     parser.add_argument('-mdim', '--model_dim', type=int, default=512)
@@ -635,10 +617,6 @@ def train():
                 optim.param_groups[0]['lr'] = lr_lambda(global_step)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optim.step()
-
-                if args.clip_critic:
-                    model.clip_critic()
-
                 optim.zero_grad()
                 global_step += 1
 
