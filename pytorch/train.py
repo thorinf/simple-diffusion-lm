@@ -165,17 +165,17 @@ class MultiHeadAttention(nn.Module):
         v = v.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.rotary_emb is not None:
-            q = self.rotary_emb.rotate_queries_or_keys(q, seq_dim=2)
-            k = self.rotary_emb.rotate_queries_or_keys(k, seq_dim=2)
+            q = self.rotary_emb.rotate_queries_or_keys(q, seq_dim=-2)
+            k = self.rotary_emb.rotate_queries_or_keys(k, seq_dim=-2)
 
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.1 if self.training else 0.0)
+        # with torch.backends.cuda.sdp_kernel(enable_flash=True):
+        #     out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.1 if self.training else 0.0)
 
-        # score = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        # if mask is not None:
-        #     score = score.masked_fill(mask == 0, -1e9)
-        # score = F.softmax(score, dim=-1)
-        # out = score @ v
+        score = (q @ k.transpose(-2, -1)) * 1.0 / math.sqrt(self.head_dim)
+        if mask is not None:
+            score = score.masked_fill(mask == 0, -1e9)
+        score = F.softmax(score, dim=-1)
+        out = score @ v
 
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_length, self.model_dim)
         return self.w_o(out)
@@ -259,13 +259,15 @@ class TransformerModel(nn.Module):
 
         self.out = nn.Linear(model_dim, target_dim)
 
+    @staticmethod
+    def self_attention_mask(length_mask):
+        return torch.logical_and(length_mask.unsqueeze(1).unsqueeze(1), length_mask.unsqueeze(1).unsqueeze(-1))
+
     def forward(self, x, t, length_mask=None):
         time_emb = self.time_mlp(t)
         x = self.project(x)
 
-        if length_mask is not None:
-            x = x * length_mask.unsqueeze(-1)
-            length_mask = length_mask.unsqueeze(1).unsqueeze(1)
+        attention_mask = None if length_mask is None else self.self_attention_mask(length_mask)
 
         scaling_weights = time_emb.view(-1, self.num_layers * 4, self.model_dim).split(1, dim=1)
         for i, layer in enumerate(self.encoder_layers):
@@ -273,7 +275,7 @@ class TransformerModel(nn.Module):
                 continue
             gammas = scaling_weights[4 * i], scaling_weights[4 * i + 1]
             betas = scaling_weights[4 * i + 2], scaling_weights[4 * i + 3]
-            x = layer(x, length_mask, gammas=gammas, betas=betas)
+            x = layer(x, attention_mask, gammas=gammas, betas=betas)
 
         return self.out(x), x
 
