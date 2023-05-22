@@ -433,6 +433,17 @@ class DiffusionLM(nn.Module):
 
         self.loss_ce = nn.CrossEntropyLoss(reduction='none')
 
+        self.apply(self.initialise_weights)
+
+    @staticmethod
+    def initialise_weights(module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.001)
+
     def get_embeddings(self, ids):
         e = self.embedding(ids)
         e = self.norm(e)
@@ -491,7 +502,6 @@ class DiffusionLM(nn.Module):
 
         accuracy = (logits.argmax(dim=-1) == ids).float().sum() / num_elems
 
-        loss_diff = loss_diff.sum() / num_elems
         loss_reconstruction = loss_reconstruction.sum() / num_elems
         loss = loss_diff + loss_reconstruction
 
